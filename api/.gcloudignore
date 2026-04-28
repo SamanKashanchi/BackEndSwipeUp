@@ -1,0 +1,12 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.env
+.env.*
+.deploy_env.tmp.yaml
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+node_modules/
