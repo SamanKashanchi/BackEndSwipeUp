@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import os
 
+from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
 
 _pool: ConnectionPool | None = None
+
+
+def _configure_connection(conn) -> None:
+    """Register pgvector on every pooled connection so SELECTs of vector columns
+    return numpy.ndarray instead of strings."""
+    register_vector(conn)
 
 
 def open_pool() -> ConnectionPool:
@@ -31,6 +38,7 @@ def open_pool() -> ConnectionPool:
         max_size=3,
         timeout=10,
         kwargs={"autocommit": False},
+        configure=_configure_connection,
     )
     _pool.wait()
     return _pool
