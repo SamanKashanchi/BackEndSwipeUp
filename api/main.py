@@ -230,7 +230,7 @@ def _retrieve_candidates(
     sql = (
         "SELECT v.video_id, v.platform, v.public_url, v.display_url, v.caption,"
         "       v.hashtags, v.video_duration, v.views, v.likes, v.comments, v.shares,"
-        "       v.video_plays, v.time_posted, v.scraped_at,"
+        "       v.time_posted, v.scraped_at,"
         "       c.handle, c.creator_name, c.profile_picture_url"
         " FROM videos v"
         " JOIN creators c ON c.creator_id = v.creator_id"
@@ -253,7 +253,7 @@ def _retrieve_candidates(
     for row in rows:
         (video_id, platform, public_url, display_url, caption,
          hashtags, video_duration, views, likes, comments, shares,
-         video_plays, time_posted, scraped_at,
+         time_posted, scraped_at,
          handle, creator_name, profile_pic) = row
         out.append({
             "video_id": video_id,
@@ -267,7 +267,6 @@ def _retrieve_candidates(
             "likes": int(likes or 0),
             "comments": int(comments or 0),
             "shares": int(shares or 0),
-            "video_plays": int(video_plays or 0),
             "time_posted": time_posted.isoformat() if time_posted else None,
             "scraped_at": scraped_at.isoformat() if scraped_at else None,
             "creator_handle": handle,
