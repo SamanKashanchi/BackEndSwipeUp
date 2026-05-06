@@ -490,3 +490,148 @@ def post_view(body: ViewBody, uid: str = Depends(verify_id_token)) -> dict:
             )
         conn.commit()
     return {"accepted": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Personal creator lists (account_creators)
+#
+# Replaces the per-user Firestore Creators subcollection. Adding a creator
+# upserts into the global `creators` pool AND inserts an account_creators
+# row in one transaction, so a personal "Track" automatically seeds the
+# global pool. `origin` records where the link came from
+# (onboarding_self, onboarding_inspiration, user_track, keyword_search, ...).
+# ──────────────────────────────────────────────────────────────────────────────
+
+from typing import Literal
+from urllib.parse import urlparse
+
+Platform = Literal["tiktok", "youtube", "instagram", "x"]
+
+
+def _normalize_handle(raw: str) -> str:
+    """Strip @, parse URL down to first path component, lowercase. Returns ''
+    if nothing usable remains. Mirrors the JS normalizeHandle in SwipeFeed."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    if s.startswith("@"):
+        s = s[1:]
+    if "://" in s:
+        try:
+            parsed = urlparse(s)
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts:
+                s = parts[0].lstrip("@").split("?")[0]
+        except Exception:
+            pass
+    return s.lower()
+
+
+def _make_creator_id(platform: str, handle: str) -> str:
+    return f"{platform.lower()}_{handle}"
+
+
+class AddCreatorRequest(BaseModel):
+    platform: Platform
+    handle: str = Field(..., min_length=1)
+    origin: str = Field(..., min_length=1, max_length=64)
+
+
+@app.post("/account/{account_id}/creators", status_code=status.HTTP_201_CREATED)
+def add_account_creator(
+    account_id: str,
+    body: AddCreatorRequest,
+    uid: str = Depends(verify_id_token),
+):
+    """Upsert a creator into the global pool and link it to this account."""
+    assert_account_owner(account_id, uid)
+
+    handle = _normalize_handle(body.handle)
+    if not handle:
+        raise HTTPException(status_code=400, detail="invalid handle")
+    creator_id = _make_creator_id(body.platform, handle)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO creators (creator_id, platform, handle, origin)"
+                " VALUES (%s, %s, %s, %s)"
+                " ON CONFLICT (creator_id) DO NOTHING",
+                (creator_id, body.platform, handle, body.origin),
+            )
+            cur.execute(
+                "INSERT INTO account_creators (account_id, creator_id, origin)"
+                " VALUES (%s, %s, %s)"
+                " ON CONFLICT (account_id, creator_id) DO NOTHING",
+                (account_id, creator_id, body.origin),
+            )
+        conn.commit()
+
+    return {
+        "creator_id": creator_id,
+        "platform": body.platform,
+        "handle": handle,
+        "origin": body.origin,
+    }
+
+
+@app.get("/account/{account_id}/creators")
+def list_account_creators(
+    account_id: str,
+    uid: str = Depends(verify_id_token),
+):
+    """Return the personal creator list for this account, newest first."""
+    assert_account_owner(account_id, uid)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.creator_id, c.platform, c.handle, c.creator_name,"
+                "       c.profile_picture_url, ac.origin, ac.added_at"
+                " FROM account_creators ac"
+                " JOIN creators c ON c.creator_id = ac.creator_id"
+                " WHERE ac.account_id = %s"
+                " ORDER BY ac.added_at DESC",
+                (account_id,),
+            )
+            rows = cur.fetchall()
+
+    return {
+        "creators": [
+            {
+                "creator_id": r[0],
+                "platform": r[1],
+                "handle": r[2],
+                "creator_name": r[3],
+                "profile_picture_url": r[4],
+                "origin": r[5],
+                "added_at": r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.delete(
+    "/account/{account_id}/creators/{creator_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_account_creator(
+    account_id: str,
+    creator_id: str,
+    uid: str = Depends(verify_id_token),
+):
+    """Remove a creator from this account's personal list. Leaves the
+    global creators row in place (it may still be tracked by other accounts
+    or referenced by videos)."""
+    assert_account_owner(account_id, uid)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM account_creators"
+                " WHERE account_id = %s AND creator_id = %s",
+                (account_id, creator_id),
+            )
+        conn.commit()
+    return None
