@@ -537,6 +537,39 @@ class AddCreatorRequest(BaseModel):
     origin: str = Field(..., min_length=1, max_length=64)
 
 
+@app.post("/creators", status_code=status.HTTP_201_CREATED)
+def seed_creator(
+    body: AddCreatorRequest,
+    uid: str = Depends(verify_id_token),
+):
+    """Seed the global creator pool only — does NOT link to any account.
+    Used when an action surfaces a candidate creator without expressing
+    a tracking relationship (e.g. swipe-right adds the video's creator
+    to the pool, but the user isn't 'tracking' them by saving the clip).
+    Idempotent: re-seeding an existing creator_id is a no-op."""
+    handle = _normalize_handle(body.handle)
+    if not handle:
+        raise HTTPException(status_code=400, detail="invalid handle")
+    creator_id = _make_creator_id(body.platform, handle)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO creators (creator_id, platform, handle, origin)"
+                " VALUES (%s, %s, %s, %s)"
+                " ON CONFLICT (creator_id) DO NOTHING",
+                (creator_id, body.platform, handle, body.origin),
+            )
+        conn.commit()
+
+    return {
+        "creator_id": creator_id,
+        "platform": body.platform,
+        "handle": handle,
+        "origin": body.origin,
+    }
+
+
 @app.post("/account/{account_id}/creators", status_code=status.HTTP_201_CREATED)
 def add_account_creator(
     account_id: str,
