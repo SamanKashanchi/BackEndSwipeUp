@@ -578,8 +578,8 @@ def seed_creator(
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO creators (creator_id, platform, handle, origin)"
-                " VALUES (%s, %s, %s, %s)"
+                "INSERT INTO creators (creator_id, platform, handle, origin, status)"
+                " VALUES (%s, %s, %s, %s, 'pending')"
                 " ON CONFLICT (creator_id) DO NOTHING",
                 (creator_id, body.platform, handle, body.origin),
             )
@@ -610,8 +610,8 @@ def add_account_creator(
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO creators (creator_id, platform, handle, origin)"
-                " VALUES (%s, %s, %s, %s)"
+                "INSERT INTO creators (creator_id, platform, handle, origin, status)"
+                " VALUES (%s, %s, %s, %s, 'pending')"
                 " ON CONFLICT (creator_id) DO NOTHING",
                 (creator_id, body.platform, handle, body.origin),
             )
