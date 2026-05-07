@@ -17,9 +17,10 @@ Ranking pipeline (GET /feed):
             creator info.
 
 Background:
-  APScheduler refreshes creator_swipe_stats matview every 5 minutes
-  (and once at startup) so creator-level swipe counters stay fresh
-  without write contention on a hot Firestore doc.
+  APScheduler refreshes creator-level swipe counters on creator_stats
+  every 5 minutes (and once at startup) — the same aggregation that
+  used to back the creator_swipe_stats matview, but written as columns
+  on creator_stats since 0013_swipe_stats_to_creator_stats.
 """
 from __future__ import annotations
 
@@ -54,21 +55,43 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _refresh_creator_swipe_stats() -> None:
-    """Run REFRESH MATERIALIZED VIEW CONCURRENTLY. CONCURRENTLY needs a unique
-    index on the matview, which 0001_init.sql doesn't define — fall back to
-    plain REFRESH if the concurrent path fails (it'll only happen once)."""
+    """Recompute creator-level swipe counters and write them onto creator_stats.
+
+    Replaces the old creator_swipe_stats matview (dropped in migration 0013).
+    Single UPDATE...FROM (aggregate) so creators that have never been swiped
+    keep their default zeros and creators with swipes get the latest counts."""
     try:
         with get_pool().connection() as conn:
             conn.autocommit = True
             with conn.cursor() as cur:
-                try:
-                    cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY creator_swipe_stats")
-                    log.info("matview refresh: creator_swipe_stats (concurrently)")
-                except Exception:
-                    cur.execute("REFRESH MATERIALIZED VIEW creator_swipe_stats")
-                    log.info("matview refresh: creator_swipe_stats (plain)")
+                cur.execute(
+                    """
+                    UPDATE creator_stats cs
+                    SET swipe_right_count        = agg.r,
+                        swipe_left_count         = agg.l,
+                        swipe_up_count           = agg.u,
+                        total_swipes             = agg.t,
+                        unique_swipers           = agg.us,
+                        swipe_stats_refreshed_at = NOW(),
+                        updated_at               = NOW()
+                    FROM (
+                      SELECT v.creator_id,
+                        COUNT(*) FILTER (WHERE i.swipe = 'right')::int AS r,
+                        COUNT(*) FILTER (WHERE i.swipe = 'left')::int  AS l,
+                        COUNT(*) FILTER (WHERE i.swipe = 'up')::int    AS u,
+                        COUNT(*) FILTER (WHERE i.swipe IS NOT NULL)::int AS t,
+                        COUNT(DISTINCT i.account_id)
+                          FILTER (WHERE i.swipe IS NOT NULL)::int AS us
+                      FROM interactions i
+                      JOIN videos v ON v.video_id = i.video_id
+                      GROUP BY v.creator_id
+                    ) agg
+                    WHERE cs.creator_id = agg.creator_id
+                    """
+                )
+                log.info("creator_stats swipe refresh: %d rows updated", cur.rowcount)
     except Exception as exc:
-        log.warning("matview refresh failed: %s: %s", type(exc).__name__, exc)
+        log.warning("creator_stats swipe refresh failed: %s: %s", type(exc).__name__, exc)
 
 
 @asynccontextmanager
@@ -89,7 +112,7 @@ async def lifespan(app: FastAPI):
     )
     _scheduler.start()
     _refresh_creator_swipe_stats()
-    log.info("startup: scheduler started, matview refreshed once")
+    log.info("startup: scheduler started, creator_stats swipe counters refreshed once")
 
     yield
 
