@@ -244,12 +244,17 @@ def _load_account_state(account_id: str) -> dict[str, Any]:
 
 
 def _retrieve_candidates(
-    *, account_id: str, niche_id: str, anchor: np.ndarray, exclude_ids: list[str], limit: int
+    *, account_id: str, anchor: np.ndarray, exclude_ids: list[str], limit: int
 ) -> list[dict]:
     """Stage 1: pgvector ANN by anchor against videos.summary_embedding_siglip,
     excluding seen interactions and the client's in-buffer ids. Returns the
     metadata + creator info needed for the response, plus the video_id list
-    for the frame fetch."""
+    for the frame fetch.
+
+    No niche scope — the feed is intentionally unrestricted across mother
+    niches so cross-niche discovery can surface. Niche-aware ordering will
+    live in the (future) Feed Engine via slot-based interleaving, not as
+    a hard filter here."""
     sql = (
         "SELECT v.video_id, v.platform, v.public_url, v.display_url, v.caption,"
         "       v.hashtags, v.video_duration, v.views, v.likes, v.comments, v.shares,"
@@ -257,8 +262,7 @@ def _retrieve_candidates(
         "       c.handle, c.creator_name, c.profile_picture_url"
         " FROM videos v"
         " JOIN creators c ON c.creator_id = v.creator_id"
-        " WHERE v.niche_id = %s"
-        "   AND v.summary_embedding_siglip IS NOT NULL"
+        " WHERE v.summary_embedding_siglip IS NOT NULL"
         "   AND NOT EXISTS ("
         "       SELECT 1 FROM interactions i"
         "       WHERE i.account_id = %s AND i.video_id = v.video_id"
@@ -269,7 +273,7 @@ def _retrieve_candidates(
     )
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (niche_id, account_id, exclude_ids, anchor, limit))
+            cur.execute(sql, (account_id, exclude_ids, anchor, limit))
             rows = cur.fetchall()
 
     out = []
@@ -410,12 +414,11 @@ def get_feed(
     exclude_ids = [s for s in exclude.split(",") if s]
 
     state = _load_account_state(account_id)
-    if state["niche_id"] is None:
-        raise HTTPException(status_code=409, detail="account has no niche_id")
+    # No niche_id gate — niche scope was dropped from stage-1. The deeper
+    # 409 in _load_account_state already covers "no niche AND no summary".
 
     candidates = _retrieve_candidates(
         account_id=account_id,
-        niche_id=state["niche_id"],
         anchor=state["stage1_anchor"],
         exclude_ids=exclude_ids,
         limit=CANDIDATE_LIMIT,
