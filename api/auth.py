@@ -21,9 +21,7 @@ import os
 
 import firebase_admin
 from fastapi import Header, HTTPException, status
-from firebase_admin import auth as firebase_auth
-
-from db import get_pool
+from firebase_admin import auth as firebase_auth, firestore as firebase_firestore
 
 log = logging.getLogger(__name__)
 
@@ -93,24 +91,21 @@ async def verify_id_token(authorization: str | None = Header(default=None)) -> s
 def assert_account_owner(account_id: str, uid: str) -> None:
     """Raise 403 unless the given Firebase UID owns the given account.
 
-    Source of truth is the Postgres `accounts` table. If the account doesn't
-    exist in Postgres, return 404 — the cleanup path is a no-op for unknown
-    accounts (e.g. legacy onboardings that never wrote to Postgres).
-    """
-    with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT user_id FROM accounts WHERE account_id = %s",
-                (account_id,),
-            )
-            row = cur.fetchone()
+    Source of truth is **Firestore** — `users/{uid}/Accounts/{account_id}`.
+    Postgres is a shadow that gets populated mid-onboarding (via the
+    POST /account/{id}/niches upsert) and intentionally lags Firestore by
+    a few seconds during sign-up. Checking Postgres here would 404 every
+    new account before they reach the niche-confirm screen, which broke
+    the Phase 2 inspirations-seeding loop.
 
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="account not found in postgres",
-        )
-    if row[0] != uid:
+    A simple Firestore document existence check is enough: if a doc lives
+    at users/{uid}/Accounts/{account_id} then that uid owns that account.
+    Firebase security rules guarantee no other uid can write into that
+    path.
+    """
+    db = firebase_firestore.client()
+    snap = db.collection("users").document(uid).collection("Accounts").document(account_id).get()
+    if not snap.exists:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="not the account owner",

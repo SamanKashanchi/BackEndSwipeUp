@@ -170,15 +170,20 @@ def delete_account(account_id: str, uid: str = Depends(verify_id_token)):
 
 
 def _load_account_state(account_id: str) -> dict[str, Any]:
-    """Pull everything stage-1 + stage-2 need for one account in two queries."""
+    """Pull everything stage-1 + stage-2 need for one account in three queries.
+
+    Niche scope moved from accounts.niche_id (Phase 1 schema) to the
+    account_niches many-to-many table (Phase 2 / migration 0020). Until
+    the slot engine ships, stage-1 still uses a single anchor — when the
+    user vector isn't built yet, we anchor on the highest-weight niche's
+    visual_embedding. That's the minimum-viable fallback; the future slot
+    engine will replace this with per-niche slot retrieval."""
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT a.user_id, a.niche_id, a.platform, a.handle,"
-                "       n.visual_embedding, n.embedding,"
+                "SELECT a.user_id, a.platform, a.handle,"
                 "       s.summary_siglip, s.summary_dino, s.summary_text"
                 " FROM accounts a"
-                " LEFT JOIN niches n ON n.niche_id = a.niche_id"
                 " LEFT JOIN account_summary_embeddings s ON s.account_id = a.account_id"
                 " WHERE a.account_id = %s",
                 (account_id,),
@@ -186,9 +191,18 @@ def _load_account_state(account_id: str) -> dict[str, Any]:
             row = cur.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="account not found")
-            (user_id, niche_id, platform, handle,
-             niche_visual, niche_text,
+            (user_id, platform, handle,
              summary_siglip, summary_dino, summary_text) = row
+
+            cur.execute(
+                "SELECT an.niche_id, an.weight, n.visual_embedding, n.embedding"
+                " FROM account_niches an"
+                " LEFT JOIN niches n ON n.niche_id = an.niche_id"
+                " WHERE an.account_id = %s"
+                " ORDER BY an.weight DESC",
+                (account_id,),
+            )
+            niche_rows = cur.fetchall()
 
             cur.execute(
                 "SELECT siglip_embedding, dino_embedding"
@@ -207,25 +221,38 @@ def _load_account_state(account_id: str) -> dict[str, Any]:
         np.stack([r[1] for r in frame_rows]).astype(np.float32) if frame_rows else None
     )
 
-    # Stage-1 anchor: prefer account summary; fall back to niche visual then text.
+    niche_ids = [r[0] for r in niche_rows]
+    top_niche_visual = next(
+        (np.asarray(r[2], dtype=np.float32) for r in niche_rows if r[2] is not None),
+        None,
+    )
+    top_niche_text = next(
+        (np.asarray(r[3], dtype=np.float32) for r in niche_rows if r[3] is not None),
+        None,
+    )
+
+    # Stage-1 anchor: prefer account summary; fall back to top-weight niche's
+    # visual_embedding, then its text embedding. Multi-niche slot retrieval
+    # is a future change — for now we anchor on the strongest single niche.
     if summary_siglip is not None:
         stage1_anchor = np.asarray(summary_siglip, dtype=np.float32)
         anchor_source = "account_summary_siglip"
-    elif niche_visual is not None:
-        stage1_anchor = np.asarray(niche_visual, dtype=np.float32)
+    elif top_niche_visual is not None:
+        stage1_anchor = top_niche_visual
         anchor_source = "niche_visual_embedding"
-    elif niche_text is not None:
-        stage1_anchor = np.asarray(niche_text, dtype=np.float32)
+    elif top_niche_text is not None:
+        stage1_anchor = top_niche_text
         anchor_source = "niche_embedding"
     else:
         raise HTTPException(
             status_code=409,
-            detail="account has no siglip summary and niche has no embedding — cannot rank",
+            detail="account has no siglip summary and no niches with embeddings — cannot rank",
         )
 
     return {
         "user_id": user_id,
-        "niche_id": niche_id,
+        "niche_ids": niche_ids,
+        "primary_niche_id": niche_ids[0] if niche_ids else None,
         "platform": platform,
         "handle": handle,
         "stage1_anchor": stage1_anchor,
@@ -442,8 +469,8 @@ def get_feed(
     top = ranked[:limit]
 
     log.info(
-        "feed: account=%s niche=%s anchor=%s candidates=%d returned=%d rerank=%s",
-        account_id, state["niche_id"], state["stage1_anchor_source"],
+        "feed: account=%s niches=%s anchor=%s candidates=%d returned=%d rerank=%s",
+        account_id, state["niche_ids"], state["stage1_anchor_source"],
         len(candidates), len(top), used_rerank,
     )
 
@@ -668,6 +695,108 @@ def list_account_creators(
             }
             for r in rows
         ]
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Multi-niche selections — POST /account/{id}/niches
+#
+# Lands at the niche-confirm screen during onboarding. Body shape carries
+# everything we need to materialise the Postgres `accounts` row (no separate
+# create-account call) and replace the account_niches set in one transaction.
+#
+# `source` is per-selection so the frontend can attribute each row as either
+# auto-matched (kept from the /match-niche-light auto_selected list) or
+# user_confirmed (the user explicitly checked or added it). Weights come
+# from /match-niche-light's response and are cached client-side.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class NicheSelection(BaseModel):
+    niche_id: str = Field(..., min_length=1, max_length=128)
+    weight:   float = Field(..., ge=0.0, le=1.0)
+    source:   Literal["auto", "user_confirmed"]
+
+
+class AccountNichesBody(BaseModel):
+    handle:     str = Field(..., min_length=1, max_length=128)
+    platform:   Platform
+    selections: list[NicheSelection] = Field(..., min_length=1, max_length=8)
+
+
+@app.post("/account/{account_id}/niches", status_code=status.HTTP_201_CREATED)
+def set_account_niches(
+    account_id: str,
+    body: AccountNichesBody,
+    uid: str = Depends(verify_id_token),
+):
+    """Replace this account's niche selections. Also upserts the accounts
+    shadow row — Phase 2 split moved account-row creation out of the heavy
+    /match-niche path and into here, so this endpoint is where the Postgres
+    account first comes into existence for new sign-ups."""
+    assert_account_owner(account_id, uid)
+
+    handle = _normalize_handle(body.handle)
+    if not handle:
+        raise HTTPException(status_code=400, detail="invalid handle")
+
+    seen: set[str] = set()
+    for s in body.selections:
+        if s.niche_id in seen:
+            raise HTTPException(status_code=400, detail=f"duplicate niche_id: {s.niche_id}")
+        seen.add(s.niche_id)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # Validate every niche_id exists. Bad ids surface as a 400 instead
+            # of a less-actionable FK violation.
+            cur.execute(
+                "SELECT niche_id FROM niches WHERE niche_id = ANY(%s)",
+                ([s.niche_id for s in body.selections],),
+            )
+            known = {r[0] for r in cur.fetchall()}
+            unknown = [s.niche_id for s in body.selections if s.niche_id not in known]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown niche_id(s): {unknown}",
+                )
+
+            with conn.transaction():
+                cur.execute(
+                    "INSERT INTO accounts (account_id, user_id, platform, handle)"
+                    " VALUES (%s, %s, %s, %s)"
+                    " ON CONFLICT (account_id) DO UPDATE SET"
+                    "    user_id    = EXCLUDED.user_id,"
+                    "    platform   = EXCLUDED.platform,"
+                    "    handle     = EXCLUDED.handle,"
+                    "    updated_at = NOW()",
+                    (account_id, uid, body.platform, handle),
+                )
+                cur.execute(
+                    "DELETE FROM account_niches WHERE account_id = %s",
+                    (account_id,),
+                )
+                cur.executemany(
+                    "INSERT INTO account_niches"
+                    "    (account_id, niche_id, weight, source)"
+                    " VALUES (%s, %s, %s, %s)",
+                    [
+                        (account_id, s.niche_id, s.weight, s.source)
+                        for s in body.selections
+                    ],
+                )
+
+    log.info(
+        "set_account_niches: account=%s niches=%s",
+        account_id, [s.niche_id for s in body.selections],
+    )
+    return {
+        "account_id": account_id,
+        "niches": [
+            {"niche_id": s.niche_id, "weight": s.weight, "source": s.source}
+            for s in body.selections
+        ],
     }
 
 
