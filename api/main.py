@@ -3,18 +3,14 @@
 Endpoints:
   GET    /health                — readiness probe (also pokes Postgres)
   DELETE /account/{account_id}  — wipe an account's Postgres footprint
-  GET    /feed                  — ranked, personalized feed
+  GET    /feed                  — slot-composed feed batch (see feed.py)
   POST   /swipe                 — record a swipe interaction
   POST   /view                  — record a view (no swipe yet)
 
-Ranking pipeline (GET /feed):
-  Stage 1 — pgvector ANN by account.summary_siglip (or niche embedding
-            fallback) to retrieve top-CANDIDATE_LIMIT candidates from the
-            user's niche, excluding seen interactions and the client's
-            in-buffer exclude list.
-  Stage 2 — Frame-level rerank in NumPy: SigLIP top-K, DINO top-K, text
-            max, weighted 0.6/0.2/0.2. Sort, take limit, hydrate with
-            creator info.
+The feed engine (GET /feed) lives in feed.py — slot mix is computed from
+unseen Tracked-creator supply + selected niches; each pool retrieves via
+pgvector ANN and reranks with frame-level scoring (when the user vector
+has built). See feed.py / feed_pools.py / feed_slots.py for details.
 
 Background:
   APScheduler refreshes creator-level swipe counters on creator_stats
@@ -28,9 +24,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 
-import numpy as np
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -41,14 +35,11 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 from auth import assert_account_owner, init_firebase, verify_id_token
 from db import close_pool, get_pool, open_pool
-from ranking import score_videos
+from feed import router as feed_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("api")
 
-CANDIDATE_LIMIT = 200          # stage-1 ANN candidate set size
-DEFAULT_FEED_LIMIT = 50        # default top-K returned to client
-MAX_FEED_LIMIT = 100
 MATVIEW_REFRESH_INTERVAL_MIN = 5
 
 _scheduler: BackgroundScheduler | None = None
@@ -132,6 +123,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# /feed endpoint lives in feed.py (slot engine + creator cooldown + dedup).
+app.include_router(feed_router)
+
 
 @app.get("/health")
 def health() -> dict:
@@ -162,325 +156,6 @@ def delete_account(account_id: str, uid: str = Depends(verify_id_token)):
 
     log.info("delete_account: account_id=%s uid=%s deleted_rows=%s", account_id, uid, deleted)
     return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Feed
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _load_account_state(account_id: str) -> dict[str, Any]:
-    """Pull everything stage-1 + stage-2 need for one account in three queries.
-
-    Niche scope moved from accounts.niche_id (Phase 1 schema) to the
-    account_niches many-to-many table (Phase 2 / migration 0020). Until
-    the slot engine ships, stage-1 still uses a single anchor — when the
-    user vector isn't built yet, we anchor on the highest-weight niche's
-    visual_embedding. That's the minimum-viable fallback; the future slot
-    engine will replace this with per-niche slot retrieval."""
-    with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT a.user_id, a.platform, a.handle,"
-                "       s.summary_siglip, s.summary_dino, s.summary_text"
-                " FROM accounts a"
-                " LEFT JOIN account_summary_embeddings s ON s.account_id = a.account_id"
-                " WHERE a.account_id = %s",
-                (account_id,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="account not found")
-            (user_id, platform, handle,
-             summary_siglip, summary_dino, summary_text) = row
-
-            cur.execute(
-                "SELECT an.niche_id, an.weight, n.visual_embedding, n.embedding"
-                " FROM account_niches an"
-                " LEFT JOIN niches n ON n.niche_id = an.niche_id"
-                " WHERE an.account_id = %s"
-                " ORDER BY an.weight DESC",
-                (account_id,),
-            )
-            niche_rows = cur.fetchall()
-
-            cur.execute(
-                "SELECT siglip_embedding, dino_embedding"
-                " FROM account_frame_embeddings"
-                " WHERE account_id = %s AND siglip_embedding IS NOT NULL"
-                "   AND dino_embedding IS NOT NULL"
-                " ORDER BY frame_idx",
-                (account_id,),
-            )
-            frame_rows = cur.fetchall()
-
-    user_siglip_frames = (
-        np.stack([r[0] for r in frame_rows]).astype(np.float32) if frame_rows else None
-    )
-    user_dino_frames = (
-        np.stack([r[1] for r in frame_rows]).astype(np.float32) if frame_rows else None
-    )
-
-    niche_ids = [r[0] for r in niche_rows]
-    top_niche_visual = next(
-        (np.asarray(r[2], dtype=np.float32) for r in niche_rows if r[2] is not None),
-        None,
-    )
-    top_niche_text = next(
-        (np.asarray(r[3], dtype=np.float32) for r in niche_rows if r[3] is not None),
-        None,
-    )
-
-    # Stage-1 anchor: prefer account summary; fall back to top-weight niche's
-    # visual_embedding, then its text embedding. Multi-niche slot retrieval
-    # is a future change — for now we anchor on the strongest single niche.
-    if summary_siglip is not None:
-        stage1_anchor = np.asarray(summary_siglip, dtype=np.float32)
-        anchor_source = "account_summary_siglip"
-    elif top_niche_visual is not None:
-        stage1_anchor = top_niche_visual
-        anchor_source = "niche_visual_embedding"
-    elif top_niche_text is not None:
-        stage1_anchor = top_niche_text
-        anchor_source = "niche_embedding"
-    else:
-        raise HTTPException(
-            status_code=409,
-            detail="account has no siglip summary and no niches with embeddings — cannot rank",
-        )
-
-    return {
-        "user_id": user_id,
-        "niche_ids": niche_ids,
-        "primary_niche_id": niche_ids[0] if niche_ids else None,
-        "platform": platform,
-        "handle": handle,
-        "stage1_anchor": stage1_anchor,
-        "stage1_anchor_source": anchor_source,
-        "summary_siglip": np.asarray(summary_siglip, dtype=np.float32) if summary_siglip is not None else None,
-        "summary_dino":   np.asarray(summary_dino,   dtype=np.float32) if summary_dino   is not None else None,
-        "summary_text":   np.asarray(summary_text,   dtype=np.float32) if summary_text   is not None else None,
-        "user_siglip_frames": user_siglip_frames,
-        "user_dino_frames":   user_dino_frames,
-        "has_full_embeddings": (
-            user_siglip_frames is not None
-            and user_dino_frames is not None
-            and summary_text is not None
-        ),
-    }
-
-
-def _retrieve_candidates(
-    *, account_id: str, anchor: np.ndarray, exclude_ids: list[str], limit: int
-) -> list[dict]:
-    """Stage 1: pgvector ANN by anchor against videos.summary_embedding_siglip,
-    excluding seen interactions and the client's in-buffer ids. Returns the
-    metadata + creator info needed for the response, plus the video_id list
-    for the frame fetch.
-
-    No niche scope — the feed is intentionally unrestricted across mother
-    niches so cross-niche discovery can surface. Niche-aware ordering will
-    live in the (future) Feed Engine via slot-based interleaving, not as
-    a hard filter here."""
-    sql = (
-        "SELECT v.video_id, v.platform, v.public_url, v.display_url, v.caption,"
-        "       v.hashtags, v.video_duration, v.views, v.likes, v.comments, v.shares,"
-        "       v.time_posted, v.scraped_at,"
-        "       c.handle, c.creator_name, c.profile_picture_url"
-        " FROM videos v"
-        " JOIN creators c ON c.creator_id = v.creator_id"
-        " WHERE v.summary_embedding_siglip IS NOT NULL"
-        "   AND NOT EXISTS ("
-        "       SELECT 1 FROM interactions i"
-        "       WHERE i.account_id = %s AND i.video_id = v.video_id"
-        "   )"
-        "   AND NOT (v.video_id = ANY(%s::text[]))"
-        " ORDER BY v.summary_embedding_siglip <=> %s"
-        " LIMIT %s"
-    )
-    with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (account_id, exclude_ids, anchor, limit))
-            rows = cur.fetchall()
-
-    out = []
-    for row in rows:
-        (video_id, platform, public_url, display_url, caption,
-         hashtags, video_duration, views, likes, comments, shares,
-         time_posted, scraped_at,
-         handle, creator_name, profile_pic) = row
-        out.append({
-            "video_id": video_id,
-            "platform": platform or "unknown",
-            "public_url": public_url,
-            "display_url": display_url,
-            "caption": caption or "",
-            "hashtags": list(hashtags or []),
-            "video_duration": float(video_duration) if video_duration is not None else None,
-            "views": int(views or 0),
-            "likes": int(likes or 0),
-            "comments": int(comments or 0),
-            "shares": int(shares or 0),
-            "time_posted": time_posted.isoformat() if time_posted else None,
-            "scraped_at": scraped_at.isoformat() if scraped_at else None,
-            "creator_handle": handle,
-            "creator_name": creator_name,
-            "creator_profile_pic": profile_pic,
-        })
-    return out
-
-
-def _fetch_video_frames(video_ids: list[str]) -> dict[str, dict[str, np.ndarray]]:
-    """Returns video_id -> {siglip: (N,1152), dino: (N,768)}. Videos with any
-    null frame embeddings are dropped — we only score against complete data."""
-    if not video_ids:
-        return {}
-    sql = (
-        "SELECT video_id, frame_idx, siglip_embedding, dino_embedding"
-        " FROM video_frame_embeddings"
-        " WHERE video_id = ANY(%s::text[])"
-        "   AND siglip_embedding IS NOT NULL"
-        "   AND dino_embedding IS NOT NULL"
-        " ORDER BY video_id, frame_idx"
-    )
-    with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (video_ids,))
-            rows = cur.fetchall()
-
-    by_id: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
-    for video_id, _frame_idx, siglip_emb, dino_emb in rows:
-        by_id.setdefault(video_id, []).append((siglip_emb, dino_emb))
-
-    out: dict[str, dict[str, np.ndarray]] = {}
-    for video_id, frames in by_id.items():
-        siglip_stack = np.stack([f[0] for f in frames]).astype(np.float32)
-        dino_stack = np.stack([f[1] for f in frames]).astype(np.float32)
-        out[video_id] = {"siglip": siglip_stack, "dino": dino_stack}
-    return out
-
-
-def _rerank(
-    candidates: list[dict],
-    video_frames: dict[str, dict[str, np.ndarray]],
-    user_siglip: np.ndarray,
-    user_dino: np.ndarray,
-    user_text: np.ndarray,
-) -> list[dict]:
-    """Run frame-level scoring across all candidates that have full frame data.
-    Candidates missing frame embeddings are dropped from the result (rare —
-    every video scraped post-DINO-deploy has them)."""
-    scorable = [c for c in candidates if c["video_id"] in video_frames]
-    if not scorable:
-        return []
-
-    # All candidates must have the same N for the einsum. New scrapes give
-    # FRAMES_PER_VIDEO=8 uniformly, but right-pad defensively.
-    max_n = max(video_frames[c["video_id"]]["siglip"].shape[0] for c in scorable)
-    V = len(scorable)
-    sig_dim = user_siglip.shape[1]
-    dino_dim = user_dino.shape[1]
-    video_siglip_3d = np.zeros((V, max_n, sig_dim), dtype=np.float32)
-    video_dino_3d = np.zeros((V, max_n, dino_dim), dtype=np.float32)
-    for i, c in enumerate(scorable):
-        s = video_frames[c["video_id"]]["siglip"]
-        d = video_frames[c["video_id"]]["dino"]
-        video_siglip_3d[i, : s.shape[0]] = s
-        video_dino_3d[i, : d.shape[0]] = d
-
-    scores = score_videos(
-        user_siglip=user_siglip,
-        user_dino=user_dino,
-        user_text=user_text,
-        video_siglip=video_siglip_3d,
-        video_dino=video_dino_3d,
-    )
-
-    for i, c in enumerate(scorable):
-        c["score"] = float(scores["final"][i])
-        c["score_semantic"] = float(scores["semantic"][i])
-        c["score_structure"] = float(scores["structure"][i])
-        c["score_text"] = float(scores["text"][i])
-
-    scorable.sort(key=lambda c: c["score"], reverse=True)
-    return scorable
-
-
-def _candidates_summary_only(
-    candidates: list[dict], anchor_source: str
-) -> list[dict]:
-    """Fallback path for legacy accounts without frame embeddings or summary
-    text. Already in stage-1 ANN order; just stamp source metadata."""
-    for c in candidates:
-        c["score"] = None
-        c["score_semantic"] = None
-        c["score_structure"] = None
-        c["score_text"] = None
-    return candidates
-
-
-@app.get("/feed")
-def get_feed(
-    account_id: str,
-    limit: int = DEFAULT_FEED_LIMIT,
-    exclude: str = "",
-    uid: str = Depends(verify_id_token),
-) -> dict:
-    """Returns up to `limit` ranked videos for this account.
-
-    Query params:
-      account_id  — Firestore Accounts/{id}
-      limit       — top-N to return (default 50, max 100)
-      exclude     — comma-separated video_ids the client already has buffered
-                    and wants the server to skip (in addition to seen-via-
-                    interactions filtering)
-    """
-    assert_account_owner(account_id, uid)
-    if limit <= 0 or limit > MAX_FEED_LIMIT:
-        raise HTTPException(status_code=400, detail=f"limit must be in 1..{MAX_FEED_LIMIT}")
-    exclude_ids = [s for s in exclude.split(",") if s]
-
-    state = _load_account_state(account_id)
-    # No niche_id gate — niche scope was dropped from stage-1. The deeper
-    # 409 in _load_account_state already covers "no niche AND no summary".
-
-    candidates = _retrieve_candidates(
-        account_id=account_id,
-        anchor=state["stage1_anchor"],
-        exclude_ids=exclude_ids,
-        limit=CANDIDATE_LIMIT,
-    )
-
-    used_rerank = False
-    if state["has_full_embeddings"] and candidates:
-        video_ids = [c["video_id"] for c in candidates]
-        video_frames = _fetch_video_frames(video_ids)
-        ranked = _rerank(
-            candidates,
-            video_frames,
-            user_siglip=state["user_siglip_frames"],
-            user_dino=state["user_dino_frames"],
-            user_text=state["summary_text"],
-        )
-        used_rerank = True
-    else:
-        ranked = _candidates_summary_only(candidates, state["stage1_anchor_source"])
-
-    top = ranked[:limit]
-
-    log.info(
-        "feed: account=%s niches=%s anchor=%s candidates=%d returned=%d rerank=%s",
-        account_id, state["niche_ids"], state["stage1_anchor_source"],
-        len(candidates), len(top), used_rerank,
-    )
-
-    return {
-        "videos": top,
-        "candidate_count": len(candidates),
-        "ranked_count": len(top),
-        "used_rerank": used_rerank,
-        "stage1_anchor": state["stage1_anchor_source"],
-    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -588,6 +263,67 @@ class AddCreatorRequest(BaseModel):
     platform: Platform
     handle: str = Field(..., min_length=1)
     origin: str = Field(..., min_length=1, max_length=64)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Accounts shadow-row create — POST /account
+#
+# Fired at the handle-entry step of onboarding, BEFORE niche selection. The
+# row needs to exist this early so the onboarding service can start building
+# the visual user-vector in parallel with the rest of the form (frame
+# embeddings FK to accounts). niche_id stays NULL until /account/{id}/niches
+# runs at the niche-confirm screen.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class CreateAccountBody(BaseModel):
+    account_id: str = Field(..., min_length=1, max_length=128)
+    handle:     str = Field(..., min_length=1, max_length=128)
+    platform:   Platform
+
+
+@app.post("/account", status_code=status.HTTP_201_CREATED)
+def create_account(
+    body: CreateAccountBody,
+    uid: str = Depends(verify_id_token),
+):
+    """Create the Postgres accounts shadow row for a new sign-up. Idempotent
+    on (account_id, uid) — re-calls during step navigation are no-ops; calls
+    for the same account_id from a different uid are rejected."""
+    handle = _normalize_handle(body.handle)
+    if not handle:
+        raise HTTPException(status_code=400, detail="invalid handle")
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # Ownership check: if the row exists under a different uid the
+            # caller is impersonating someone else's account_id, reject hard.
+            cur.execute(
+                "SELECT user_id FROM accounts WHERE account_id = %s",
+                (body.account_id,),
+            )
+            existing = cur.fetchone()
+            if existing is not None and existing[0] != uid:
+                raise HTTPException(status_code=403, detail="account_id owned by another user")
+
+            cur.execute(
+                "INSERT INTO accounts (account_id, user_id, platform, handle)"
+                " VALUES (%s, %s, %s, %s)"
+                " ON CONFLICT (account_id) DO UPDATE SET"
+                "    platform   = EXCLUDED.platform,"
+                "    handle     = EXCLUDED.handle,"
+                "    updated_at = NOW()",
+                (body.account_id, uid, body.platform, handle),
+            )
+        conn.commit()
+
+    log.info("create_account: account_id=%s uid=%s handle=%s", body.account_id, uid, handle)
+    return {
+        "account_id": body.account_id,
+        "user_id": uid,
+        "platform": body.platform,
+        "handle": handle,
+    }
 
 
 @app.post("/creators", status_code=status.HTTP_201_CREATED)
@@ -701,9 +437,9 @@ def list_account_creators(
 # ──────────────────────────────────────────────────────────────────────────────
 # Multi-niche selections — POST /account/{id}/niches
 #
-# Lands at the niche-confirm screen during onboarding. Body shape carries
-# everything we need to materialise the Postgres `accounts` row (no separate
-# create-account call) and replace the account_niches set in one transaction.
+# Lands at the niche-confirm screen during onboarding. The accounts shadow
+# row already exists at this point (created by POST /account at handle entry),
+# so this endpoint only replaces the account_niches set.
 #
 # `source` is per-selection so the frontend can attribute each row as either
 # auto-matched (kept from the /match-niche-light auto_selected list) or
@@ -719,8 +455,6 @@ class NicheSelection(BaseModel):
 
 
 class AccountNichesBody(BaseModel):
-    handle:     str = Field(..., min_length=1, max_length=128)
-    platform:   Platform
     selections: list[NicheSelection] = Field(..., min_length=1, max_length=8)
 
 
@@ -730,15 +464,9 @@ def set_account_niches(
     body: AccountNichesBody,
     uid: str = Depends(verify_id_token),
 ):
-    """Replace this account's niche selections. Also upserts the accounts
-    shadow row — Phase 2 split moved account-row creation out of the heavy
-    /match-niche path and into here, so this endpoint is where the Postgres
-    account first comes into existence for new sign-ups."""
+    """Replace this account's niche selections. The accounts row must
+    already exist (POST /account creates it at handle entry)."""
     assert_account_owner(account_id, uid)
-
-    handle = _normalize_handle(body.handle)
-    if not handle:
-        raise HTTPException(status_code=400, detail="invalid handle")
 
     seen: set[str] = set()
     for s in body.selections:
@@ -748,6 +476,16 @@ def set_account_niches(
 
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM accounts WHERE account_id = %s",
+                (account_id,),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="accounts row does not exist — POST /account first",
+                )
+
             # Validate every niche_id exists. Bad ids surface as a 400 instead
             # of a less-actionable FK violation.
             cur.execute(
@@ -763,16 +501,6 @@ def set_account_niches(
                 )
 
             with conn.transaction():
-                cur.execute(
-                    "INSERT INTO accounts (account_id, user_id, platform, handle)"
-                    " VALUES (%s, %s, %s, %s)"
-                    " ON CONFLICT (account_id) DO UPDATE SET"
-                    "    user_id    = EXCLUDED.user_id,"
-                    "    platform   = EXCLUDED.platform,"
-                    "    handle     = EXCLUDED.handle,"
-                    "    updated_at = NOW()",
-                    (account_id, uid, body.platform, handle),
-                )
                 cur.execute(
                     "DELETE FROM account_niches WHERE account_id = %s",
                     (account_id,),
