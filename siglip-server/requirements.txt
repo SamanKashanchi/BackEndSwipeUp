@@ -1,0 +1,14 @@
+torch
+torchvision
+transformers
+fastapi
+uvicorn[standard]
+numpy
+sentencepiece
+protobuf
+opencv-python-headless
+httpx
+Pillow
+psycopg[binary]>=3.2
+pgvector>=0.3
+python-dotenv>=1.0
