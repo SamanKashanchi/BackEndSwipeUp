@@ -263,6 +263,11 @@ class AddCreatorRequest(BaseModel):
     platform: Platform
     handle: str = Field(..., min_length=1)
     origin: str = Field(..., min_length=1, max_length=64)
+    # Optional provisional niche — e.g. the Track button passes the tracked
+    # video's niche_id. Validated against `niches` before use. When absent
+    # (add-by-handle from ManageFeed/onboarding), provisional stays null and
+    # eval determines the niche from the creator's own videos.
+    niche_id: str | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -375,11 +380,24 @@ def add_account_creator(
 
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
+            # Provisional niche = the tracked video's niche (the Track button
+            # passes it), validated against `niches`. Absent (add-by-handle from
+            # ManageFeed/onboarding) -> null, and eval classifies the niche from
+            # the creator's own videos instead.
+            provisional = None
+            if body.niche_id:
+                cur.execute("SELECT 1 FROM niches WHERE niche_id = %s", (body.niche_id,))
+                if cur.fetchone():
+                    provisional = body.niche_id
+
             cur.execute(
-                "INSERT INTO creators (creator_id, platform, handle, origin, status)"
-                " VALUES (%s, %s, %s, %s, 'pending')"
-                " ON CONFLICT (creator_id) DO NOTHING",
-                (creator_id, body.platform, handle, body.origin),
+                "INSERT INTO creators (creator_id, platform, handle, origin, status, provisional_niche_id)"
+                " VALUES (%s, %s, %s, %s, 'pending', %s)"
+                " ON CONFLICT (creator_id) DO UPDATE SET"
+                # fill provisional only if it's currently null — never overwrite
+                # a discovery niche or a measured signal
+                "    provisional_niche_id = COALESCE(creators.provisional_niche_id, EXCLUDED.provisional_niche_id)",
+                (creator_id, body.platform, handle, body.origin, provisional),
             )
             cur.execute(
                 "INSERT INTO account_creators (account_id, creator_id, origin)"
