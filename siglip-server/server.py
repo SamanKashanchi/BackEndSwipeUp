@@ -593,8 +593,8 @@ def _build_light_match_text(req: LightMatchRequest) -> tuple[str, int]:
 def match_niche_light(req: LightMatchRequest) -> LightMatchResponse:
     """Fast text-only niche match for the niche-confirm screen.
 
-    No video scraping, no DB writes. Just BGE-style cosine of an embedded
-    text concatenation against the cached niche vectors. Sub-second.
+    No video scraping, no DB writes. Just a cosine of an embedded text
+    concatenation against the cached niche vectors. Sub-second.
 
     used_fallback flips true when:
       - the concatenated text is too sparse (< LIGHT_MIN_TOKEN_COUNT tokens), OR
