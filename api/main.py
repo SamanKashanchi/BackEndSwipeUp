@@ -4,6 +4,7 @@ Endpoints:
   GET    /health                — readiness probe (also pokes Postgres)
   DELETE /account/{account_id}  — wipe an account's Postgres footprint
   GET    /feed                  — slot-composed feed batch (see feed.py)
+  GET    /search                — text/topic semantic search (see search.py)
   POST   /swipe                 — record a swipe interaction
   POST   /view                  — record a view (no swipe yet)
 
@@ -36,6 +37,7 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 from auth import assert_account_owner, init_firebase, verify_id_token
 from db import close_pool, get_pool, open_pool
 from feed import router as feed_router
+from search import router as search_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("api")
@@ -125,6 +127,8 @@ app.add_middleware(
 
 # /feed endpoint lives in feed.py (slot engine + creator cooldown + dedup).
 app.include_router(feed_router)
+# /search endpoint lives in search.py (query->SigLIP text embed + pgvector ANN).
+app.include_router(search_router)
 
 
 @app.get("/health")

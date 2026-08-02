@@ -7,3 +7,4 @@ numpy>=1.26
 apscheduler>=3.10
 firebase-admin>=6.5
 python-dotenv>=1.0
+httpx>=0.27
