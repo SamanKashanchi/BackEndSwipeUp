@@ -8,10 +8,9 @@ Endpoints:
   POST   /swipe                 — record a swipe interaction
   POST   /view                  — record a view (no swipe yet)
 
-The feed engine (GET /feed) lives in feed.py — slot mix is computed from
-unseen Tracked-creator supply + selected niches; each pool retrieves via
-pgvector ANN and reranks with frame-level scoring (when the user vector
-has built). See feed.py / feed_pools.py / feed_slots.py for details.
+The feed engine (GET /feed) lives in feed.py — newest unseen videos from
+the account's tracked creators (account_creators), with a per-creator
+cooldown. No niches or embeddings.
 
 Background:
   APScheduler refreshes creator-level swipe counters on creator_stats
