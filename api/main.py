@@ -37,6 +37,7 @@ from auth import assert_account_owner, init_firebase, verify_id_token
 from db import close_pool, get_pool, open_pool
 from feed import router as feed_router
 from search import router as search_router
+import refresh_trigger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("api")
@@ -399,9 +400,12 @@ def add_account_creator(
                 " ON CONFLICT (creator_id) DO UPDATE SET"
                 # fill provisional only if it's currently null — never overwrite
                 # a discovery niche or a measured signal
-                "    provisional_niche_id = COALESCE(creators.provisional_niche_id, EXCLUDED.provisional_niche_id)",
+                "    provisional_niche_id = COALESCE(creators.provisional_niche_id, EXCLUDED.provisional_niche_id)"
+                " RETURNING last_scraped_at",
                 (creator_id, body.platform, handle, body.origin, provisional),
             )
+            row = cur.fetchone()
+            never_scraped = row is None or row[0] is None
             cur.execute(
                 "INSERT INTO account_creators (account_id, creator_id, origin)"
                 " VALUES (%s, %s, %s)"
@@ -409,6 +413,11 @@ def add_account_creator(
                 (account_id, creator_id, body.origin),
             )
         conn.commit()
+
+    # Pull this creator's videos now instead of waiting for the scheduled run.
+    # Creators someone already tracks have videos, so only new ones trigger.
+    if never_scraped:
+        refresh_trigger.request_refresh(reason=creator_id)
 
     return {
         "creator_id": creator_id,
