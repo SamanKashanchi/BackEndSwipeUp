@@ -74,6 +74,32 @@ def _account_exists(account_id: str) -> bool:
             return cur.fetchone() is not None
 
 
+# Tracked creators whose first pull hasn't landed yet: never scraped, no
+# failure recorded (private/broken accounts fail and drop out), added recently
+# (so one the scraper never got to doesn't show "gathering" forever).
+GATHERING_WINDOW_MINUTES = 60
+_GATHERING_SQL = (
+    "SELECT c.creator_id, c.platform, c.handle"
+    "  FROM account_creators ac"
+    "  JOIN creators c ON c.creator_id = ac.creator_id"
+    " WHERE ac.account_id = %s"
+    "   AND c.last_scraped_at IS NULL"
+    "   AND c.last_failure_at IS NULL"
+    "   AND ac.added_at > NOW() - %s * INTERVAL '1 minute'"
+    " ORDER BY ac.added_at, c.creator_id"
+)
+
+
+def _fetch_gathering(account_id: str) -> list[dict]:
+    """Creators we're still pulling first videos for. Lets the swipe page show
+    a "grabbing videos" screen instead of "you're all caught up"."""
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_GATHERING_SQL, (account_id, GATHERING_WINDOW_MINUTES))
+            rows = cur.fetchall()
+    return [{"creator_id": r[0], "platform": r[1], "handle": r[2]} for r in rows]
+
+
 def _fetch_candidates(account_id: str, exclude_ids: list[str], limit: int) -> list[dict]:
     """Newest-first unseen videos from the account's tracked creators. Each
     candidate gets a recency score in (0, 1], newest == 1.0, so the creator
@@ -185,6 +211,8 @@ def build_batch(
         "rerank_applied":           False,
         "fallback_slots":           0,
         "session_creator_counts":   session_creator_counts,
+        # Non-empty while new creators' first videos are still being scraped.
+        "gathering":                _fetch_gathering(account_id),
     }
 
 
