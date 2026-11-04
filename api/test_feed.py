@@ -31,9 +31,10 @@ def _pool(spec: list[tuple[str, str]]) -> list[dict]:
 
 @pytest.fixture
 def patch_db(monkeypatch):
-    def _apply(pool, exists=True):
+    def _apply(pool, exists=True, gathering=()):
         monkeypatch.setattr(feed, "_account_exists", lambda _a: exists)
         monkeypatch.setattr(feed, "_fetch_candidates", lambda _a, _e, _l: list(pool))
+        monkeypatch.setattr(feed, "_fetch_gathering", lambda _a: list(gathering))
     return _apply
 
 
@@ -86,3 +87,15 @@ def test_response_keeps_legacy_keys(patch_db):
                 "session_creator_counts"):
         assert key in out
     assert out["batch"][0]["video"]["url"] == "https://x/v1.mp4"
+
+
+def test_gathering_reported_with_empty_batch(patch_db):
+    patch_db([], gathering=[{"creator_id": "tiktok_new", "platform": "tiktok", "handle": "new"}])
+    out = feed.build_batch("acct", {}, [], 15)
+    assert out["batch"] == []
+    assert out["gathering"] == [{"creator_id": "tiktok_new", "platform": "tiktok", "handle": "new"}]
+
+
+def test_gathering_empty_by_default(patch_db):
+    patch_db(_pool([("v1", "a")]))
+    assert feed.build_batch("acct", {}, [], 15)["gathering"] == []
