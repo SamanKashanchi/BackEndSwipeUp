@@ -37,6 +37,7 @@ from auth import assert_account_owner, init_firebase, verify_id_token
 from db import close_pool, get_pool, open_pool
 from feed import router as feed_router
 from search import router as search_router
+from notifications import router as notifications_router
 import refresh_trigger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -121,7 +122,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"https://([a-z0-9-]+\.)?getswipeup\.com|https://.*\.vercel\.app|http://localhost:\d+",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -129,6 +130,8 @@ app.add_middleware(
 app.include_router(feed_router)
 # /search endpoint lives in search.py (query->SigLIP text embed + pgvector ANN).
 app.include_router(search_router)
+# Web Push: device subscriptions, settings, and the cron-driven sender.
+app.include_router(notifications_router)
 
 
 @app.get("/health")
