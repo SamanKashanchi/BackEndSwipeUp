@@ -4,7 +4,9 @@ GET    /account/{account_id}/keywords           list, oldest first
 POST   /account/{account_id}/keywords           add one ({"keyword": "..."})
 DELETE /account/{account_id}/keywords/{keyword} remove one
 
-A keyword is searched on the channel's own platform (accounts.platform).
+A keyword is searched on the channel's own platform (accounts.platform),
+except where that platform has no keyword search (Instagram, X): those
+channels search TikTok instead (KEYWORD_SEARCH_PLATFORM).
 The acquire job (ContentEngine refresh_keywords.py) pulls each distinct
 (keyword, platform) and links the posts it finds in video_keywords; /feed
 shows them. Adding a keyword nobody has pulled yet starts the job right away,
@@ -28,6 +30,15 @@ log = logging.getLogger("swipeup.keywords")
 MAX_KEYWORDS_PER_ACCOUNT = 5
 MAX_KEYWORD_LEN = 50
 
+# Channel platform -> platform its keywords are searched on. Instagram has no
+# keyword search, so Instagram channels get top TikTok posts for a keyword.
+KEYWORD_SEARCH_PLATFORM = {"instagram": "tiktok", "x": "tiktok"}
+
+
+def search_platform_for(account_platform: str) -> str:
+    p = (account_platform or "").lower()
+    return KEYWORD_SEARCH_PLATFORM.get(p, p)
+
 router = APIRouter()
 
 
@@ -46,7 +57,7 @@ def _account_platform(cur, account_id: str) -> str:
     row = cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="account not found")
-    return row[0]
+    return search_platform_for(row[0])
 
 
 def _list(cur, account_id: str) -> list[dict]:

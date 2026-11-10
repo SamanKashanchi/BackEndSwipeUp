@@ -16,3 +16,10 @@ def test_normalize_empty():
 
 def test_normalize_caps_length():
     assert len(normalize_keyword("x" * 200)) == 50
+
+
+def test_instagram_channels_search_tiktok():
+    from keywords import search_platform_for
+    assert search_platform_for("instagram") == "tiktok"
+    assert search_platform_for("youtube") == "youtube"
+    assert search_platform_for("tiktok") == "tiktok"
