@@ -99,3 +99,39 @@ def test_gathering_reported_with_empty_batch(patch_db):
 def test_gathering_empty_by_default(patch_db):
     patch_db(_pool([("v1", "a")]))
     assert feed.build_batch("acct", {}, [], 15)["gathering"] == []
+
+
+# ── Breakout score ────────────────────────────────────────────────────────────
+
+def test_breakout_uses_creator_median_first():
+    assert feed.breakout_for(800, 100, 20, 400, 30) == (8.0, "creator")
+
+
+def test_breakout_falls_back_to_keyword_median():
+    # Creator found by keyword: we hold only 1 of their posts.
+    assert feed.breakout_for(800, 50, 1, 200, 15) == (4.0, "keyword")
+
+
+def test_breakout_none_without_baseline():
+    assert feed.breakout_for(800, None, None, None, None) == (None, None)
+    assert feed.breakout_for(800, 100, 2, 100, 2) == (None, None)
+
+
+def test_fresh_breakout_beats_old_bigger_one():
+    fresh = feed.feed_score(5.0, 1)
+    old = feed.feed_score(8.0, 120)
+    assert fresh > old
+
+
+def test_unknown_baseline_is_neutral():
+    assert feed.feed_score(None, 0) == 1.0
+
+
+def test_breakout_shaped_into_response():
+    c = _cand("v1", "a")
+    c.update(breakout_ratio=8.234, breakout_basis="creator", source="keyword", matched_keyword="ai art")
+    out = feed._shape_response_video(c)
+    assert out["breakout"] == {"ratio": 8.2, "basis": "creator"}
+    assert out["source"] == "keyword"
+    assert out["matched_keyword"] == "ai art"
+    assert feed._shape_response_video(_cand("v2", "a"))["breakout"] is None

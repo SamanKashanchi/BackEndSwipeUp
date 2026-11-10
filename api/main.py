@@ -38,6 +38,7 @@ from db import close_pool, get_pool, open_pool
 from feed import router as feed_router
 from search import router as search_router
 from notifications import router as notifications_router
+from keywords import router as keywords_router
 import refresh_trigger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -132,6 +133,7 @@ app.include_router(feed_router)
 app.include_router(search_router)
 # Web Push: device subscriptions, settings, and the cron-driven sender.
 app.include_router(notifications_router)
+app.include_router(keywords_router)
 
 
 @app.get("/health")
