@@ -1,9 +1,11 @@
-"""SwipeUp Feed Engine — MVP creator feed.
+"""SwipeUp Feed Engine — MVP creator + keyword feed.
 
 GET /feed
-  Returns up to FEED_BATCH_SIZE videos for an account: the newest videos from
-  the creators the account tracks (account_creators) that it hasn't seen yet.
-  A per-creator cooldown keeps one creator from filling a whole batch.
+  Returns up to FEED_BATCH_SIZE unseen videos for an account, from the
+  creators it tracks (account_creators) and from its active keywords
+  (account_keywords -> video_keywords). Videos are ranked by breakout score
+  (views vs. the usual views, see breakout_for) discounted by age, and a
+  per-creator cooldown keeps one creator from filling a whole batch.
 
   No niches and no embeddings. The previous slot-composed engine
   (feed_pools.py / feed_slots.py / ranking.py) is left in the repo but is no
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote_plus
 
@@ -42,29 +45,99 @@ router = APIRouter()
 
 # ── Candidate retrieval ───────────────────────────────────────────────────────
 
-_CANDIDATES_SQL = (
-    "SELECT v.video_id, v.niche_id, v.creator_id, v.platform, v.public_url,"
-    "       v.display_url, v.caption, v.hashtags, v.video_duration,"
-    "       v.views, v.likes, v.comments, v.shares, v.time_posted, v.scraped_at,"
-    "       c.handle, c.creator_name, c.profile_picture_url"
-    "  FROM videos v"
-    "  JOIN creators c ON c.creator_id = v.creator_id"
-    " WHERE v.creator_id IN ("
-    "       SELECT ac.creator_id FROM account_creators ac WHERE ac.account_id = %s"
-    "   )"
-    "   AND NOT EXISTS ("
-    "       SELECT 1 FROM interactions i"
-    "        WHERE i.account_id = %s AND i.video_id = v.video_id"
-    "   )"
-    "   AND (v.content_group_id IS NULL OR v.content_group_id NOT IN ("
-    "       SELECT DISTINCT vv.content_group_id FROM videos vv"
-    "         JOIN interactions i ON i.video_id = vv.video_id"
-    "        WHERE i.account_id = %s AND vv.content_group_id IS NOT NULL"
-    "   ))"
-    "   AND NOT (v.video_id = ANY(%s::text[]))"
-    " ORDER BY COALESCE(v.time_posted, v.scraped_at) DESC, v.video_id"
-    " LIMIT %s"
+_CANDIDATES_SQL = """
+WITH my_kw AS (
+    SELECT keyword, platform FROM account_keywords
+     WHERE account_id = %(account_id)s AND active
+),
+kw_videos AS (
+    SELECT vk.video_id, MIN(vk.keyword) AS matched_keyword
+      FROM video_keywords vk
+      JOIN my_kw USING (keyword, platform)
+     GROUP BY vk.video_id
+),
+cand AS (
+    SELECT v.video_id, v.niche_id, v.creator_id, v.platform, v.public_url,
+           v.display_url, v.caption, v.hashtags, v.video_duration,
+           v.views, v.likes, v.comments, v.shares, v.time_posted, v.scraped_at,
+           kv.matched_keyword, (ac.creator_id IS NOT NULL) AS tracked
+      FROM videos v
+      LEFT JOIN kw_videos kv ON kv.video_id = v.video_id
+      LEFT JOIN account_creators ac
+             ON ac.account_id = %(account_id)s AND ac.creator_id = v.creator_id
+     WHERE (ac.creator_id IS NOT NULL OR kv.video_id IS NOT NULL)
+       AND NOT EXISTS (
+           SELECT 1 FROM interactions i
+            WHERE i.account_id = %(account_id)s AND i.video_id = v.video_id
+       )
+       AND (v.content_group_id IS NULL OR v.content_group_id NOT IN (
+           SELECT DISTINCT vv.content_group_id FROM videos vv
+             JOIN interactions i ON i.video_id = vv.video_id
+            WHERE i.account_id = %(account_id)s AND vv.content_group_id IS NOT NULL
+       ))
+       AND NOT (v.video_id = ANY(%(exclude)s::text[]))
+     ORDER BY COALESCE(v.time_posted, v.scraped_at) DESC, v.video_id
+     LIMIT %(limit)s
+),
+creator_base AS (
+    SELECT creator_id,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY views) AS med,
+           COUNT(*) AS n
+      FROM videos
+     WHERE views > 0 AND creator_id IN (SELECT creator_id FROM cand)
+     GROUP BY creator_id
+),
+kw_base AS (
+    SELECT vk.keyword, vk.platform,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY v.views) AS med,
+           COUNT(*) AS n
+      FROM video_keywords vk
+      JOIN my_kw USING (keyword, platform)
+      JOIN videos v ON v.video_id = vk.video_id
+     WHERE v.views > 0
+     GROUP BY vk.keyword, vk.platform
 )
+SELECT cand.video_id, cand.niche_id, cand.creator_id, cand.platform, cand.public_url,
+       cand.display_url, cand.caption, cand.hashtags, cand.video_duration,
+       cand.views, cand.likes, cand.comments, cand.shares, cand.time_posted, cand.scraped_at,
+       c.handle, c.creator_name, c.profile_picture_url,
+       cand.matched_keyword, cand.tracked,
+       cb.med, cb.n, kb.med, kb.n
+  FROM cand
+  JOIN creators c ON c.creator_id = cand.creator_id
+  LEFT JOIN creator_base cb ON cb.creator_id = cand.creator_id
+  LEFT JOIN kw_base kb ON kb.keyword = cand.matched_keyword AND kb.platform = cand.platform
+"""
+
+# ── Breakout score ────────────────────────────────────────────────────────────
+#
+# breakout = a post's views / the usual views for its source:
+#   * the creator's median views, when we hold at least MIN_BASELINE_VIDEOS of
+#     their posts (tracked creators, ~20+ posts each), else
+#   * the median views of everything found for the matched keyword.
+# No baseline -> neutral 1.0 and no tag on the card.
+# The feed score divides breakout by an age factor so a fresh 5x post beats a
+# year-old 8x one: score = breakout / (1 + age_days / RECENCY_DAYS).
+
+MIN_BASELINE_VIDEOS = 5
+RECENCY_DAYS = 14.0
+BREAKOUT_FLOOR = 0.05
+BREAKOUT_CAP = 50.0
+
+
+def breakout_for(views: int, creator_med, creator_n, kw_med, kw_n) -> tuple[float | None, str | None]:
+    """(ratio, basis) where basis is 'creator' or 'keyword', or (None, None)."""
+    if creator_med and creator_n and creator_n >= MIN_BASELINE_VIDEOS and creator_med > 0:
+        return views / float(creator_med), "creator"
+    if kw_med and kw_n and kw_n >= MIN_BASELINE_VIDEOS and kw_med > 0:
+        return views / float(kw_med), "keyword"
+    return None, None
+
+
+def feed_score(ratio: float | None, age_days: float | None) -> float:
+    r = 1.0 if ratio is None else min(max(ratio, BREAKOUT_FLOOR), BREAKOUT_CAP)
+    age = max(age_days or 0.0, 0.0)
+    return r / (1.0 + age / RECENCY_DAYS)
 
 
 def _account_exists(account_id: str) -> bool:
@@ -90,59 +163,87 @@ _GATHERING_SQL = (
 )
 
 
+# Keywords added recently whose first search hasn't run yet (same window).
+_GATHERING_KEYWORDS_SQL = (
+    "SELECT keyword, platform"
+    "  FROM account_keywords"
+    " WHERE account_id = %s AND active"
+    "   AND last_pulled_at IS NULL"
+    "   AND platform IN ('tiktok', 'youtube')"
+    "   AND created_at > NOW() - %s * INTERVAL '1 minute'"
+    " ORDER BY created_at, keyword, platform"
+)
+
+
 def _fetch_gathering(account_id: str) -> list[dict]:
-    """Creators we're still pulling first videos for. Lets the swipe page show
-    a "grabbing videos" screen instead of "you're all caught up"."""
+    """Creators and keywords we're still pulling first videos for. Lets the
+    swipe page show a "grabbing videos" screen instead of "you're all caught
+    up". Keyword entries carry `keyword` and use "#<keyword>" as the handle."""
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(_GATHERING_SQL, (account_id, GATHERING_WINDOW_MINUTES))
             rows = cur.fetchall()
-    return [{"creator_id": r[0], "platform": r[1], "handle": r[2]} for r in rows]
+            cur.execute(_GATHERING_KEYWORDS_SQL, (account_id, GATHERING_WINDOW_MINUTES))
+            kw_rows = cur.fetchall()
+    out = [{"creator_id": r[0], "platform": r[1], "handle": r[2]} for r in rows]
+    out += [
+        {"creator_id": f"keyword:{r[1]}:{r[0]}", "platform": r[1], "handle": f"#{r[0]}", "keyword": r[0]}
+        for r in kw_rows
+    ]
+    return out
 
 
 def _fetch_candidates(account_id: str, exclude_ids: list[str], limit: int) -> list[dict]:
-    """Newest-first unseen videos from the account's tracked creators. Each
-    candidate gets a recency score in (0, 1], newest == 1.0, so the creator
-    cooldown in _pick_best can trade recency against variety."""
+    """Unseen videos from the account's tracked creators AND from its active
+    keywords (newest `limit` of them), each scored by breakout and age."""
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 _CANDIDATES_SQL,
-                (account_id, account_id, account_id, exclude_ids, limit),
+                {"account_id": account_id, "exclude": exclude_ids, "limit": limit},
             )
             rows = cur.fetchall()
+    now = datetime.now(timezone.utc)
+    return [_row_to_candidate(row, now) for row in rows]
 
-    n = len(rows)
-    candidates: list[dict] = []
-    for i, row in enumerate(rows):
-        (video_id, niche_id, creator_id, platform, public_url, display_url, caption,
-         hashtags, video_duration, views, likes, comments, shares,
-         time_posted, scraped_at, handle, creator_name, profile_pic) = row
-        candidates.append({
-            "video_id":            video_id,
-            "niche_id":            niche_id,
-            "creator_id":          creator_id,
-            "platform":            platform or "unknown",
-            "public_url":          public_url,
-            "display_url":         display_url,
-            "caption":             caption or "",
-            "hashtags":            list(hashtags or []),
-            "video_duration":      float(video_duration) if video_duration is not None else None,
-            "views":               int(views or 0),
-            "likes":               int(likes or 0),
-            "comments":            int(comments or 0),
-            "shares":              int(shares or 0),
-            "time_posted":         time_posted.isoformat() if time_posted else None,
-            "scraped_at":          scraped_at.isoformat() if scraped_at else None,
-            "creator_handle":      handle,
-            "creator_name":        creator_name,
-            "creator_profile_pic": profile_pic,
-            "score":               (n - i) / n,
-            "score_semantic":      None,
-            "score_structure":     None,
-            "score_text":          None,
-        })
-    return candidates
+
+def _row_to_candidate(row: tuple, now: datetime) -> dict:
+    (video_id, niche_id, creator_id, platform, public_url, display_url, caption,
+     hashtags, video_duration, views, likes, comments, shares,
+     time_posted, scraped_at, handle, creator_name, profile_pic,
+     matched_keyword, tracked, creator_med, creator_n, kw_med, kw_n) = row
+    views = int(views or 0)
+    ratio, basis = breakout_for(views, creator_med, creator_n, kw_med, kw_n)
+    when = time_posted or scraped_at
+    age_days = (now - when).total_seconds() / 86400.0 if when else None
+    return {
+        "video_id":            video_id,
+        "niche_id":            niche_id,
+        "creator_id":          creator_id,
+        "platform":            platform or "unknown",
+        "public_url":          public_url,
+        "display_url":         display_url,
+        "caption":             caption or "",
+        "hashtags":            list(hashtags or []),
+        "video_duration":      float(video_duration) if video_duration is not None else None,
+        "views":               views,
+        "likes":               int(likes or 0),
+        "comments":            int(comments or 0),
+        "shares":              int(shares or 0),
+        "time_posted":         time_posted.isoformat() if time_posted else None,
+        "scraped_at":          scraped_at.isoformat() if scraped_at else None,
+        "creator_handle":      handle,
+        "creator_name":        creator_name,
+        "creator_profile_pic": profile_pic,
+        "source":              "creator" if tracked else "keyword",
+        "matched_keyword":     matched_keyword,
+        "breakout_ratio":      ratio,
+        "breakout_basis":      basis,
+        "score":               feed_score(ratio, age_days),
+        "score_semantic":      None,
+        "score_structure":     None,
+        "score_text":          None,
+    }
 
 
 # ── build_batch ───────────────────────────────────────────────────────────────
@@ -271,6 +372,14 @@ def _shape_response_video(c: dict) -> dict:
         "score_structure": c.get("score_structure"),
         "score_text":      c.get("score_text"),
         "niche_id":        c.get("niche_id"),
+        # Why it's in the feed: a tracked creator, or one of the keywords.
+        "source":          c.get("source", "creator"),
+        "matched_keyword": c.get("matched_keyword"),
+        # e.g. {"ratio": 8.2, "basis": "creator"} -> "8x usual views".
+        "breakout": (
+            {"ratio": round(c["breakout_ratio"], 1), "basis": c.get("breakout_basis")}
+            if c.get("breakout_ratio") is not None else None
+        ),
     }
 
 
@@ -285,7 +394,7 @@ def get_feed(
     session_creator_counts: str = "",
     uid: str = Depends(verify_id_token),
 ) -> dict:
-    """Newest unseen videos from the account's tracked creators.
+    """Unseen videos from tracked creators and keywords, breakouts first.
 
     Query params:
       account_id              — Firestore Accounts/{id}
