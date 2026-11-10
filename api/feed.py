@@ -163,14 +163,34 @@ _GATHERING_SQL = (
 )
 
 
+# Keywords added recently whose first search hasn't run yet (same window).
+_GATHERING_KEYWORDS_SQL = (
+    "SELECT keyword, platform"
+    "  FROM account_keywords"
+    " WHERE account_id = %s AND active"
+    "   AND last_pulled_at IS NULL"
+    "   AND platform IN ('tiktok', 'youtube')"
+    "   AND created_at > NOW() - %s * INTERVAL '1 minute'"
+    " ORDER BY created_at, keyword, platform"
+)
+
+
 def _fetch_gathering(account_id: str) -> list[dict]:
-    """Creators we're still pulling first videos for. Lets the swipe page show
-    a "grabbing videos" screen instead of "you're all caught up"."""
+    """Creators and keywords we're still pulling first videos for. Lets the
+    swipe page show a "grabbing videos" screen instead of "you're all caught
+    up". Keyword entries carry `keyword` and use "#<keyword>" as the handle."""
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(_GATHERING_SQL, (account_id, GATHERING_WINDOW_MINUTES))
             rows = cur.fetchall()
-    return [{"creator_id": r[0], "platform": r[1], "handle": r[2]} for r in rows]
+            cur.execute(_GATHERING_KEYWORDS_SQL, (account_id, GATHERING_WINDOW_MINUTES))
+            kw_rows = cur.fetchall()
+    out = [{"creator_id": r[0], "platform": r[1], "handle": r[2]} for r in rows]
+    out += [
+        {"creator_id": f"keyword:{r[1]}:{r[0]}", "platform": r[1], "handle": f"#{r[0]}", "keyword": r[0]}
+        for r in kw_rows
+    ]
+    return out
 
 
 def _fetch_candidates(account_id: str, exclude_ids: list[str], limit: int) -> list[dict]:
