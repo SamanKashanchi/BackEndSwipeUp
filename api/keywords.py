@@ -6,7 +6,9 @@ DELETE /account/{account_id}/keywords/{keyword} remove one
 
 A keyword is searched on the channel's own platform (accounts.platform),
 except where that platform has no keyword search (Instagram, X): those
-channels search TikTok instead (KEYWORD_SEARCH_PLATFORM).
+channels search TikTok AND YouTube Shorts (KEYWORD_SEARCH_PLATFORMS). There is
+one account_keywords row per (keyword, search platform); the 5-keyword limit
+counts distinct keywords.
 The acquire job (ContentEngine refresh_keywords.py) pulls each distinct
 (keyword, platform) and links the posts it finds in video_keywords; /feed
 shows them. Adding a keyword nobody has pulled yet starts the job right away,
@@ -30,14 +32,14 @@ log = logging.getLogger("swipeup.keywords")
 MAX_KEYWORDS_PER_ACCOUNT = 5
 MAX_KEYWORD_LEN = 50
 
-# Channel platform -> platform its keywords are searched on. Instagram has no
-# keyword search, so Instagram channels get top TikTok posts for a keyword.
-KEYWORD_SEARCH_PLATFORM = {"instagram": "tiktok", "x": "tiktok"}
+# Channel platform -> platforms its keywords are searched on. Instagram and X
+# have no keyword search, so those channels get top TikTok + YouTube Shorts.
+KEYWORD_SEARCH_PLATFORMS = {"instagram": ("tiktok", "youtube"), "x": ("tiktok", "youtube")}
 
 
-def search_platform_for(account_platform: str) -> str:
+def search_platforms_for(account_platform: str) -> tuple[str, ...]:
     p = (account_platform or "").lower()
-    return KEYWORD_SEARCH_PLATFORM.get(p, p)
+    return KEYWORD_SEARCH_PLATFORMS.get(p, (p,))
 
 router = APIRouter()
 
@@ -45,33 +47,35 @@ router = APIRouter()
 def normalize_keyword(raw: str) -> str:
     """Lowercase, drop leading '#', collapse whitespace. '' if nothing is left.
 
-    Instagram searches hashtags, which can't contain spaces, so the scraper
-    joins words there; the stored keyword keeps the user's spacing."""
+    The stored keyword keeps the user's spacing."""
     s = (raw or "").strip().lstrip("#").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s[:MAX_KEYWORD_LEN].strip()
 
 
-def _account_platform(cur, account_id: str) -> str:
+def _search_platforms(cur, account_id: str) -> tuple[str, ...]:
     cur.execute("SELECT platform FROM accounts WHERE account_id = %s", (account_id,))
     row = cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="account not found")
-    return search_platform_for(row[0])
+    return search_platforms_for(row[0])
 
 
 def _list(cur, account_id: str) -> list[dict]:
+    """One entry per keyword, with every platform it is searched on."""
     cur.execute(
-        "SELECT keyword, platform, created_at, last_pulled_at"
+        "SELECT keyword, array_agg(platform ORDER BY platform),"
+        "       MIN(created_at), MAX(last_pulled_at)"
         "  FROM account_keywords"
         " WHERE account_id = %s AND active"
-        " ORDER BY created_at, keyword",
+        " GROUP BY keyword"
+        " ORDER BY MIN(created_at), keyword",
         (account_id,),
     )
     return [
         {
             "keyword": r[0],
-            "platform": r[1],
+            "platforms": list(r[1] or []),
             "created_at": r[2].isoformat() if r[2] else None,
             "last_pulled_at": r[3].isoformat() if r[3] else None,
         }
@@ -105,7 +109,7 @@ def add_keyword(
 
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
-            platform = _account_platform(cur, account_id)
+            platforms = _search_platforms(cur, account_id)
             # Lock this account's rows so two fast adds can't both pass the cap.
             cur.execute(
                 "SELECT keyword FROM account_keywords"
@@ -118,28 +122,30 @@ def add_keyword(
                     status_code=409,
                     detail=f"keyword limit reached ({MAX_KEYWORDS_PER_ACCOUNT})",
                 )
-            cur.execute(
-                "INSERT INTO account_keywords (account_id, keyword, platform)"
-                " VALUES (%s, %s, %s)"
-                " ON CONFLICT (account_id, keyword, platform) DO UPDATE SET active = TRUE",
-                (account_id, keyword, platform),
-            )
-            # Does anyone already have fresh posts for this search?
-            cur.execute(
-                "SELECT 1 FROM account_keywords"
-                " WHERE keyword = %s AND platform = %s AND last_pulled_at IS NOT NULL"
-                " LIMIT 1",
-                (keyword, platform),
-            )
-            never_pulled = cur.fetchone() is None
+            never_pulled = False
+            for platform in platforms:
+                cur.execute(
+                    "INSERT INTO account_keywords (account_id, keyword, platform)"
+                    " VALUES (%s, %s, %s)"
+                    " ON CONFLICT (account_id, keyword, platform) DO UPDATE SET active = TRUE",
+                    (account_id, keyword, platform),
+                )
+                # Does anyone already have fresh posts for this search?
+                cur.execute(
+                    "SELECT 1 FROM account_keywords"
+                    " WHERE keyword = %s AND platform = %s AND last_pulled_at IS NOT NULL"
+                    " LIMIT 1",
+                    (keyword, platform),
+                )
+                never_pulled = never_pulled or cur.fetchone() is None
             keywords = _list(cur, account_id)
         conn.commit()
 
     if never_pulled:
-        refresh_trigger.request_refresh(reason=f"keyword:{platform}:{keyword}")
+        refresh_trigger.request_refresh(reason=f"keyword:{keyword}")
 
-    log.info("add_keyword: account=%s keyword=%r platform=%s", account_id, keyword, platform)
-    return {"keyword": keyword, "platform": platform, "keywords": keywords}
+    log.info("add_keyword: account=%s keyword=%r platforms=%s", account_id, keyword, platforms)
+    return {"keyword": keyword, "platforms": list(platforms), "keywords": keywords}
 
 
 @router.delete(
